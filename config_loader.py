@@ -223,3 +223,46 @@ def clear_cache():
     global _config_cache
     _config_cache = {}
 
+
+def get_client_id_from_request(request) -> str:
+    """
+    Extract client_id from FastAPI request (query params or headers).
+    
+    Args:
+        request: FastAPI Request object
+        
+    Returns:
+        Client ID string
+        
+    Raises:
+        HTTPException: If client_id is missing or client not found
+    """
+    from fastapi import HTTPException
+    
+    # Try to get client_id from query params or headers
+    client_id = None
+    if hasattr(request, 'query_params'):
+        client_id = request.query_params.get("client_id")
+    if not client_id and hasattr(request, 'headers'):
+        client_id = request.headers.get("X-Client-ID")
+    
+    if not client_id:
+        raise HTTPException(
+            status_code=400,
+            detail="client_id is required (query param or X-Client-ID header)"
+        )
+    
+    # Normalize client_id
+    client_id = client_id.lower().strip()
+    
+    # Validate client exists
+    try:
+        get_client_config(client_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Client '{client_id}' not found"
+        )
+    
+    return client_id
+
