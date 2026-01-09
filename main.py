@@ -38,14 +38,44 @@ logger.add("postprocessor.log", rotation="10 MB", level="INFO")
 # FastAPI app
 app = FastAPI(title="Multi-Tenant Postprocessor", version="2.0.0")
 
-# Add CORS middleware
+# Add CORS middleware (configurable via environment)
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Client-ID", "X-Request-ID"],  # Expose custom headers
+    max_age=600,  # Cache preflight requests for 10 minutes
 )
+
+# Tenant Context Middleware
+@app.middleware("http")
+async def tenant_context_middleware(request: Request, call_next):
+    """
+    Middleware to extract and store tenant/client context in request state.
+    Logs which tenant is accessing which resource for monitoring and debugging.
+    """
+    # Extract client_id from query params or headers
+    client_id = request.query_params.get("client_id") or request.headers.get("X-Client-ID")
+    
+    # Store in request state for easy access throughout request lifecycle
+    request.state.client_id = client_id
+    request.state.has_client_context = bool(client_id)
+    
+    # Log tenant context (optional - can be disabled in production)
+    if client_id:
+        logger.debug(f"[Tenant: {client_id}] {request.method} {request.url.path}")
+    
+    # Process request
+    response = await call_next(request)
+    
+    # Add client_id to response headers for tracking
+    if client_id:
+        response.headers["X-Client-ID"] = client_id
+    
+    return response
 
 # Configuration
 MONGODB_URI = os.getenv("MONGODB_URI", "")
@@ -59,29 +89,29 @@ if not OPENAI_API_KEY:
 # Initialize OpenAI client
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# MongoDB clients cache: {client_id: client}
-mongodb_clients: dict = {}
-mongodb_lock = threading.Lock()
-
-
-def get_mongodb_client_for_client(client_id: str):
-    """Get or create MongoDB client for a specific client"""
-    with mongodb_lock:
-        if client_id in mongodb_clients:
-            return mongodb_clients[client_id]
-        
-        try:
-            client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-            client.admin.command('ping')
-            mongodb_clients[client_id] = client
-            logger.info(f"MongoDB connection established for client {client_id}")
-            return client
-        except (ConnectionFailure, ServerSelectionTimeoutError) as e:
-            logger.error(f"Failed to connect to MongoDB for client {client_id}: {e}")
-            raise HTTPException(status_code=500, detail=f"MongoDB connection failed: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error connecting to MongoDB for client {client_id}: {e}")
-            raise HTTPException(status_code=500, detail=f"MongoDB error: {str(e)}")
+# Initialize MongoDB client with connection pooling
+# Single client instance shared across all requests and all client databases
+try:
+    mongodb_client = MongoClient(
+        MONGODB_URI,
+        maxPoolSize=50,  # Maximum 50 connections in pool
+        minPoolSize=10,  # Minimum 10 connections always ready
+        maxIdleTimeMS=45000,  # Close idle connections after 45s
+        serverSelectionTimeoutMS=5000,  # Timeout for server selection
+        connectTimeoutMS=10000,  # Timeout for initial connection
+        socketTimeoutMS=45000,  # Timeout for socket operations
+        retryWrites=True,  # Retry writes on network errors
+        retryReads=True,  # Retry reads on network errors
+    )
+    # Test connection
+    mongodb_client.admin.command('ping')
+    logger.info("✅ MongoDB connection pool initialized successfully")
+except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+    logger.error(f"❌ Failed to connect to MongoDB: {e}")
+    raise ValueError(f"MongoDB connection failed: {str(e)}")
+except Exception as e:
+    logger.error(f"❌ Error connecting to MongoDB: {e}")
+    raise ValueError(f"MongoDB error: {str(e)}")
 
 
 def normalize_phone_number(phone_number: str) -> str:
@@ -291,10 +321,9 @@ JSON:"""
             phone_db_format = f"91{phone_number}"
             user_doc["phone_number"] = phone_db_format
         
-        # Get MongoDB client and database for this client
-        client = get_mongodb_client_for_client(client_id)
+        # Get database for this client (using shared MongoDB client pool)
         db_name = get_mongodb_database_name(client_id)
-        db = client[db_name]
+        db = mongodb_client[db_name]
         users_collection = db["users"]
         
         # Check if user already exists
@@ -427,75 +456,83 @@ async def process_conversation(request: Request, conversation_request: Conversat
             logger.info("No phone number found, attempting to extract email...")
             email = extract_email(conversation)
             
-            if not email:
-                raise HTTPException(status_code=400, detail="Could not extract phone number or email from conversation")
-            
-            logger.info(f"Extracted email: {email}")
+            if email:
+                logger.info(f"Extracted email: {email}")
+            else:
+                logger.info("No phone number or email found - conversation will be stored without user association")
         else:
             logger.info(f"Extracted phone number: {phone_number}")
         
         languages_used = detect_languages(conversation)
         logger.info(f"Detected languages: {languages_used}")
         
-        # Get MongoDB client and database for this client
-        client = get_mongodb_client_for_client(client_id)
+        # Get database for this client (using shared MongoDB client pool)
         db_name = get_mongodb_database_name(client_id)
-        db = client[db_name]
+        db = mongodb_client[db_name]
         users_collection = db["users"]
         analytics_collection = db["userAnalytics"]
         
         user = None
+        user_id = None
         
-        # Try to find user by phone number first
-        if phone_number:
-            phone_db_format = f"91{phone_number}"
-            user = users_collection.find_one({"phone_number": phone_db_format})
-        
-        # If not found by phone, try to find by email
-        if not user and email:
-            email_normalized = email.lower().strip()
-            user = users_collection.find_one({"email": email_normalized})
-        
-        if not user:
-            # User doesn't exist - create new user
-            logger.info("User not found, creating new user...")
-            user = create_user_from_conversation(client_id, conversation, phone_number=phone_number, email=email)
+        # Only try to find/create user if we have phone or email
+        if phone_number or email:
+            # Try to find user by phone number first
+            if phone_number:
+                phone_db_format = f"91{phone_number}"
+                user = users_collection.find_one({"phone_number": phone_db_format})
+            
+            # If not found by phone, try to find by email
+            if not user and email:
+                email_normalized = email.lower().strip()
+                user = users_collection.find_one({"email": email_normalized})
             
             if not user:
-                raise HTTPException(status_code=500, detail="Failed to create user")
+                # User doesn't exist - create new user
+                logger.info("User not found, creating new user...")
+                user = create_user_from_conversation(client_id, conversation, phone_number=phone_number, email=email)
+                
+                if not user:
+                    logger.warning("Failed to create user, conversation will be stored without user association")
+                else:
+                    logger.info(f"User created: {user.get('name', 'Unknown')}")
+            else:
+                logger.info(f"User found: {user.get('name', 'Unknown')}")
+            
+            if user:
+                user_id = user.get("_id")
         else:
-            logger.info(f"User found: {user.get('name', 'Unknown')}")
+            logger.info("No user identification found - storing conversation as anonymous")
         
-        user_id = user.get("_id")
-        
-        if not user_id:
-            raise HTTPException(status_code=500, detail="User ID not found")
-        
-        # Phase 2: Generate/update analytics
-        logger.info("Phase 2: Generating analytics...")
-        analytics_doc = generate_analytics(client_id, conversation, user_id)
-        
-        if not analytics_doc:
-            raise HTTPException(status_code=500, detail="Failed to generate analytics")
-        
-        # Check if analytics already exists for this user
-        existing_analytics = analytics_collection.find_one({"user_id": ObjectId(user_id)})
-        
-        if existing_analytics:
-            logger.info("Updating existing analytics...")
-            analytics_collection.update_one(
-                {"user_id": ObjectId(user_id)},
-                {"$set": analytics_doc}
-            )
-            analytics_doc["_id"] = existing_analytics.get("_id")
-            logger.info("Analytics updated successfully")
+        # Phase 2: Generate/update analytics (only if user exists)
+        analytics_doc = None
+        if user_id:
+            logger.info("Phase 2: Generating analytics...")
+            analytics_doc = generate_analytics(client_id, conversation, user_id)
+            
+            if not analytics_doc:
+                logger.warning("Failed to generate analytics, skipping analytics storage")
+            else:
+                # Check if analytics already exists for this user
+                existing_analytics = analytics_collection.find_one({"user_id": ObjectId(user_id)})
+                
+                if existing_analytics:
+                    logger.info("Updating existing analytics...")
+                    analytics_collection.update_one(
+                        {"user_id": ObjectId(user_id)},
+                        {"$set": analytics_doc}
+                    )
+                    analytics_doc["_id"] = existing_analytics.get("_id")
+                    logger.info("Analytics updated successfully")
+                else:
+                    logger.info("Creating new analytics...")
+                    result = analytics_collection.insert_one(analytics_doc)
+                    analytics_doc["_id"] = result.inserted_id
+                    logger.info("Analytics created successfully")
         else:
-            logger.info("Creating new analytics...")
-            result = analytics_collection.insert_one(analytics_doc)
-            analytics_doc["_id"] = result.inserted_id
-            logger.info("Analytics created successfully")
+            logger.info("Phase 2: Skipping analytics (no user identified)")
         
-        # Phase 3: Store conversation history
+        # Phase 3: Store conversation history (always, even without user)
         logger.info("Phase 3: Storing conversation history...")
         conversation_history_collection = db["conversationHistory"]
         
@@ -503,13 +540,14 @@ async def process_conversation(request: Request, conversation_request: Conversat
         logger.info("Normalized conversation tags to strict 'User:' and 'Agent:' format")
         
         conversation_history_doc = {
-            "user_id": ObjectId(user_id),
+            "user_id": ObjectId(user_id) if user_id else None,  # Store null if no user
             "conversation": normalized_conversation,
             "timestamp": datetime.now(),
-            "languages_used": languages_used
+            "languages_used": languages_used,
+            "anonymous": not bool(user_id)  # Flag to indicate anonymous conversation
         }
         
-        logger.info("Creating new conversation history document...")
+        logger.info(f"Creating new conversation history document (anonymous={not bool(user_id)})...")
         result = conversation_history_collection.insert_one(conversation_history_doc)
         conversation_history_doc["_id"] = result.inserted_id
         logger.info(f"Conversation history created successfully with ID: {result.inserted_id}")
@@ -520,24 +558,25 @@ async def process_conversation(request: Request, conversation_request: Conversat
             "message": "Conversation processed successfully",
             "client_id": client_id,
             "user": {
-                "_id": str(user.get("_id")),
-                "name": user.get("name"),
-                "email": user.get("email"),
-                "phone_number": user.get("phone_number")
-            },
+                "_id": str(user.get("_id")) if user else None,
+                "name": user.get("name") if user else None,
+                "email": user.get("email") if user else None,
+                "phone_number": user.get("phone_number") if user else None
+            } if user else None,
             "analytics": {
-                "_id": str(analytics_doc.get("_id")),
-                "user_id": str(analytics_doc.get("user_id")),
-                "course_interest": analytics_doc.get("course_interest"),
-                "city": analytics_doc.get("city"),
-                "budget": analytics_doc.get("budget"),
-                "hostel_needed": analytics_doc.get("hostel_needed"),
-                "intent_level": analytics_doc.get("intent_level")
-            },
+                "_id": str(analytics_doc.get("_id")) if analytics_doc else None,
+                "user_id": str(analytics_doc.get("user_id")) if analytics_doc else None,
+                "course_interest": analytics_doc.get("course_interest") if analytics_doc else None,
+                "city": analytics_doc.get("city") if analytics_doc else None,
+                "budget": analytics_doc.get("budget") if analytics_doc else None,
+                "hostel_needed": analytics_doc.get("hostel_needed") if analytics_doc else None,
+                "intent_level": analytics_doc.get("intent_level") if analytics_doc else None
+            } if analytics_doc else None,
             "conversation_history": {
                 "_id": str(conversation_history_doc.get("_id")),
-                "user_id": str(conversation_history_doc.get("user_id")),
-                "conversation": conversation_history_doc.get("conversation")
+                "user_id": str(conversation_history_doc.get("user_id")) if conversation_history_doc.get("user_id") else None,
+                "conversation": conversation_history_doc.get("conversation"),
+                "anonymous": conversation_history_doc.get("anonymous", False)
             }
         }
         
