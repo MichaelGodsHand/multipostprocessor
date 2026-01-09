@@ -276,7 +276,7 @@ Email address:"""
 
 
 def create_user_from_conversation(client_id: str, conversation: str, phone_number: Optional[str] = None, email: Optional[str] = None) -> Optional[dict]:
-    """Create user record from conversation using OpenAI"""
+    """Create user record from conversation using OpenAI. Name and email are optional (nullable)."""
     try:
         prompt = f"""Analyze the following conversation and extract the user's information.
 Extract the following information:
@@ -289,7 +289,7 @@ Return the information in JSON format:
     "email": "email@example.com"
 }}
 
-If any information is not found, use empty string "" for that field.
+If any information is not found, use null for that field.
 
 Conversation:
 {conversation}
@@ -299,7 +299,7 @@ JSON:"""
         response = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are a data extraction assistant. Extract user information from conversations and return valid JSON."},
+                {"role": "system", "content": "You are a data extraction assistant. Extract user information from conversations and return valid JSON. Use null for missing fields."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,
@@ -308,12 +308,23 @@ JSON:"""
         
         user_data = json.loads(response.choices[0].message.content)
         
-        extracted_email = email or user_data.get("email", "")
-        if extracted_email:
-            extracted_email = extracted_email.lower().strip()
+        # Extract name - can be null
+        extracted_name = user_data.get("name")
+        if extracted_name and isinstance(extracted_name, str):
+            extracted_name = extracted_name.strip() or None
+        else:
+            extracted_name = None
         
+        # Extract email - can be null
+        extracted_email = email or user_data.get("email")
+        if extracted_email and isinstance(extracted_email, str):
+            extracted_email = extracted_email.lower().strip() or None
+        else:
+            extracted_email = None
+        
+        # Build user document with nullable fields
         user_doc = {
-            "name": user_data.get("name", ""),
+            "name": extracted_name,
             "email": extracted_email
         }
         
@@ -344,8 +355,16 @@ JSON:"""
         result = users_collection.insert_one(user_doc)
         user_doc["_id"] = result.inserted_id
         
-        identifier = f"phone: {phone_db_format}" if phone_number else f"email: {extracted_email}"
-        logger.info(f"Created new user: {user_doc['name']} ({identifier}, client: {client_id})")
+        identifier_parts = []
+        if extracted_name:
+            identifier_parts.append(f"name: {extracted_name}")
+        if phone_number:
+            identifier_parts.append(f"phone: {phone_db_format}")
+        if extracted_email:
+            identifier_parts.append(f"email: {extracted_email}")
+        identifier = ", ".join(identifier_parts) if identifier_parts else "anonymous"
+        
+        logger.info(f"Created new user: {identifier} (client: {client_id})")
         
         return user_doc
         
@@ -354,68 +373,91 @@ JSON:"""
         return None
 
 
-def generate_analytics(client_id: str, conversation: str, user_id: ObjectId) -> Optional[dict]:
-    """Generate analytics from conversation using OpenAI"""
+def generate_analytics(client_id: str, conversation: str, conversation_history_id: str) -> Optional[dict]:
+    """Generate basic call analytics from conversation using OpenAI"""
     try:
-        prompt = f"""Analyze the following conversation and extract analytics information about the user.
-Extract the following information:
-1. course_interest: The engineering branch or course they're interested in
-2. city: The city they're from or located in
-3. budget: Their budget range for education
-4. hostel_needed: Boolean value (true or false) - whether they need hostel accommodation
-5. intent_level: One of "TOFU" (Top of Funnel - early interest), "MOFU" (Middle of Funnel - considering), or "BOFU" (Bottom of Funnel - ready to enroll)
-
-Return the information in JSON format:
-{{
-    "course_interest": "course name in lowercase",
-    "city": "city name",
-    "budget": "budget range as mentioned",
-    "hostel_needed": true or false,
-    "intent_level": "TOFU" or "MOFU" or "BOFU"
-}}
+        # Calculate conversation duration (approximate based on word count)
+        words = conversation.split()
+        estimated_duration = len(words) / 150  # Average speaking rate ~150 wpm
+        
+        prompt = f"""Analyze the following conversation between a user and an agent. Extract comprehensive call analytics.
 
 Conversation:
 {conversation}
 
-JSON:"""
+Provide detailed analytics in JSON format with these EXACT fields:
+{{
+    "call_quality_score": <0-100 integer, overall quality of the conversation>,
+    "engagement_score": <0-100 integer, how engaged both parties were>,
+    "caller_talk_percentage": <0-100 integer, percentage of conversation by caller/user>,
+    "client_talk_percentage": <0-100 integer, percentage of conversation by agent/client>,
+    "client_sentiment_index": <-1.0 to 1.0 float, agent's sentiment: -1=negative, 0=neutral, 1=positive>,
+    "agent_sentiment_index": <-1.0 to 1.0 float, user's sentiment: -1=negative, 0=neutral, 1=positive>,
+    "question_rate_per_minute": <float, number of questions asked per minute>,
+    "clarification_score": <0-100 integer, how well questions were clarified>,
+    "objection_handling_effectiveness": <0-100 integer, if applicable, else 100>,
+    "clarity_index_wpm": <integer, estimated words per minute - aim for 130-160>,
+    "filler_word_percentage": <0-100 float, percentage of filler words like um, uh, like>,
+    "interruptions_count": <integer, number of interruptions>,
+    "sentiment_bias": <-1.0 to 1.0 float, difference between agent and client sentiment>,
+    "interest_moments": [<array of strings, key moments where user showed high interest>],
+    "next_step_compliance": <boolean, were next steps clearly defined and agreed upon>,
+    "topics_discussed": [
+        {{
+            "heading": "<topic heading>",
+            "content": "<brief description of what was discussed>"
+        }}
+    ],
+    "action_items": [<array of strings, concrete action items from the conversation>],
+    "call_summary": "<2-3 sentence summary of the entire conversation>"
+}}
+
+Return ONLY valid JSON, no markdown or extra text."""
 
         response = openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are an analytics extraction assistant. Extract user analytics from conversations and return valid JSON."},
+                {"role": "system", "content": "You are a call analytics expert. Analyze conversations and extract detailed metrics. Return only valid JSON."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,
             response_format={"type": "json_object"}
         )
-        
+
         analytics_data = json.loads(response.choices[0].message.content)
         
-        hostel_needed = analytics_data.get("hostel_needed", False)
-        if isinstance(hostel_needed, str):
-            hostel_needed = hostel_needed.lower() in ["true", "yes", "1", "needed", "required"]
-        
-        course_interest = analytics_data.get("course_interest") or ""
-        course_interest = course_interest.lower() if isinstance(course_interest, str) else ""
-        
-        city = analytics_data.get("city") or ""
-        
-        intent_level = analytics_data.get("intent_level") or "TOFU"
-        intent_level = intent_level.upper() if isinstance(intent_level, str) else "TOFU"
-        
+        # Build the analytics document with the new schema
         analytics_doc = {
-            "user_id": user_id,
-            "course_interest": course_interest,
-            "city": city,
-            "budget": analytics_data.get("budget", ""),
-            "hostel_needed": bool(hostel_needed),
-            "intent_level": intent_level
+            "conversationHistory_id": conversation_history_id,
+            "analysis_timestamp": datetime.now(),
+            "metrics": {
+                "call_quality_score": int(analytics_data.get("call_quality_score", 50)),
+                "engagement_score": int(analytics_data.get("engagement_score", 50)),
+                "caller_talk_percentage": int(analytics_data.get("caller_talk_percentage", 50)),
+                "client_talk_percentage": int(analytics_data.get("client_talk_percentage", 50)),
+                "client_sentiment_index": float(analytics_data.get("client_sentiment_index", 0.0)),
+                "agent_sentiment_index": float(analytics_data.get("agent_sentiment_index", 0.0)),
+                "question_rate_per_minute": float(analytics_data.get("question_rate_per_minute", 0.0)),
+                "clarification_score": int(analytics_data.get("clarification_score", 50)),
+                "objection_handling_effectiveness": int(analytics_data.get("objection_handling_effectiveness", 100)),
+                "clarity_index_wpm": int(analytics_data.get("clarity_index_wpm", 140)),
+                "filler_word_percentage": float(analytics_data.get("filler_word_percentage", 0.0)),
+                "interruptions_count": int(analytics_data.get("interruptions_count", 0)),
+                "sentiment_bias": float(analytics_data.get("sentiment_bias", 0.0)),
+                "interest_moments": analytics_data.get("interest_moments", []),
+                "next_step_compliance": bool(analytics_data.get("next_step_compliance", False)),
+                "call_duration_minutes": round(estimated_duration, 1),
+                "topics_discussed": analytics_data.get("topics_discussed", []),
+                "action_items": analytics_data.get("action_items", []),
+                "call_summary": analytics_data.get("call_summary", "")
+            }
         }
-        
+
+        logger.info("Analytics generated successfully")
         return analytics_doc
-        
+
     except Exception as e:
-        logger.error(f"Error generating analytics for client {client_id}: {e}")
+        logger.error(f"Error generating analytics for client {client_id}: {e}", exc_info=True)
         return None
 
 
@@ -470,7 +512,7 @@ async def process_conversation(request: Request, conversation_request: Conversat
         db_name = get_mongodb_database_name(client_id)
         db = mongodb_client[db_name]
         users_collection = db["users"]
-        analytics_collection = db["userAnalytics"]
+        analytics_collection = db["callAnalytics"]  # Changed from userAnalytics to callAnalytics
         
         user = None
         user_id = None
@@ -488,51 +530,23 @@ async def process_conversation(request: Request, conversation_request: Conversat
                 user = users_collection.find_one({"email": email_normalized})
             
             if not user:
-                # User doesn't exist - create new user
+                # User doesn't exist - create new user (name and email are now optional)
                 logger.info("User not found, creating new user...")
                 user = create_user_from_conversation(client_id, conversation, phone_number=phone_number, email=email)
                 
                 if not user:
                     logger.warning("Failed to create user, conversation will be stored without user association")
                 else:
-                    logger.info(f"User created: {user.get('name', 'Unknown')}")
+                    logger.info(f"User created: {user.get('name', 'Anonymous')}")
             else:
-                logger.info(f"User found: {user.get('name', 'Unknown')}")
+                logger.info(f"User found: {user.get('name', 'Anonymous')}")
             
             if user:
                 user_id = user.get("_id")
         else:
             logger.info("No user identification found - storing conversation as anonymous")
         
-        # Phase 2: Generate/update analytics (only if user exists)
-        analytics_doc = None
-        if user_id:
-            logger.info("Phase 2: Generating analytics...")
-            analytics_doc = generate_analytics(client_id, conversation, user_id)
-            
-            if not analytics_doc:
-                logger.warning("Failed to generate analytics, skipping analytics storage")
-            else:
-                # Check if analytics already exists for this user
-                existing_analytics = analytics_collection.find_one({"user_id": ObjectId(user_id)})
-                
-                if existing_analytics:
-                    logger.info("Updating existing analytics...")
-                    analytics_collection.update_one(
-                        {"user_id": ObjectId(user_id)},
-                        {"$set": analytics_doc}
-                    )
-                    analytics_doc["_id"] = existing_analytics.get("_id")
-                    logger.info("Analytics updated successfully")
-                else:
-                    logger.info("Creating new analytics...")
-                    result = analytics_collection.insert_one(analytics_doc)
-                    analytics_doc["_id"] = result.inserted_id
-                    logger.info("Analytics created successfully")
-        else:
-            logger.info("Phase 2: Skipping analytics (no user identified)")
-        
-        # Phase 3: Store conversation history (always, even without user)
+        # Phase 3: Store conversation history FIRST (always, even without user)
         logger.info("Phase 3: Storing conversation history...")
         conversation_history_collection = db["conversationHistory"]
         
@@ -550,13 +564,28 @@ async def process_conversation(request: Request, conversation_request: Conversat
         logger.info(f"Creating new conversation history document (anonymous={not bool(user_id)})...")
         result = conversation_history_collection.insert_one(conversation_history_doc)
         conversation_history_doc["_id"] = result.inserted_id
-        logger.info(f"Conversation history created successfully with ID: {result.inserted_id}")
+        conversation_history_id = str(result.inserted_id)
+        logger.info(f"Conversation history created successfully with ID: {conversation_history_id}")
+        
+        # Phase 2: Generate analytics (always, for every conversation)
+        analytics_doc = None
+        logger.info("Phase 2: Generating call analytics...")
+        analytics_doc = generate_analytics(client_id, conversation, conversation_history_id)
+        
+        if not analytics_doc:
+            logger.warning("Failed to generate analytics, skipping analytics storage")
+        else:
+            logger.info("Creating new call analytics...")
+            result = analytics_collection.insert_one(analytics_doc)
+            analytics_doc["_id"] = result.inserted_id
+            logger.info(f"Call analytics created successfully with ID: {result.inserted_id}")
         
         # Prepare response
         response = {
             "status": "success",
             "message": "Conversation processed successfully",
             "client_id": client_id,
+            "conversation_history_id": conversation_history_id,
             "user": {
                 "_id": str(user.get("_id")) if user else None,
                 "name": user.get("name") if user else None,
@@ -565,12 +594,9 @@ async def process_conversation(request: Request, conversation_request: Conversat
             } if user else None,
             "analytics": {
                 "_id": str(analytics_doc.get("_id")) if analytics_doc else None,
-                "user_id": str(analytics_doc.get("user_id")) if analytics_doc else None,
-                "course_interest": analytics_doc.get("course_interest") if analytics_doc else None,
-                "city": analytics_doc.get("city") if analytics_doc else None,
-                "budget": analytics_doc.get("budget") if analytics_doc else None,
-                "hostel_needed": analytics_doc.get("hostel_needed") if analytics_doc else None,
-                "intent_level": analytics_doc.get("intent_level") if analytics_doc else None
+                "conversationHistory_id": analytics_doc.get("conversationHistory_id") if analytics_doc else None,
+                "analysis_timestamp": str(analytics_doc.get("analysis_timestamp")) if analytics_doc else None,
+                "metrics": analytics_doc.get("metrics") if analytics_doc else None
             } if analytics_doc else None,
             "conversation_history": {
                 "_id": str(conversation_history_doc.get("_id")),
