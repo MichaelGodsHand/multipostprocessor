@@ -22,7 +22,7 @@ _mongo_client = None
 
 
 def get_mongodb_client():
-    """Get MongoDB client for config storage"""
+    """Get MongoDB client for config storage with connection pooling"""
     global _mongo_client
     if _mongo_client is not None:
         return _mongo_client
@@ -32,8 +32,19 @@ def get_mongodb_client():
         return None
     
     try:
-        _mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+        _mongo_client = MongoClient(
+            MONGODB_URI,
+            maxPoolSize=50,  # Maximum 50 connections in pool
+            minPoolSize=10,  # Minimum 10 connections always ready
+            maxIdleTimeMS=45000,  # Close idle connections after 45s
+            serverSelectionTimeoutMS=5000,  # Timeout for server selection
+            connectTimeoutMS=10000,  # Timeout for initial connection
+            socketTimeoutMS=45000,  # Timeout for socket operations
+            retryWrites=True,  # Retry writes on network errors
+            retryReads=True,  # Retry reads on network errors
+        )
         _mongo_client.admin.command('ping')
+        logger.info("✅ MongoDB connection pool initialized for config_loader")
         return _mongo_client
     except (ConnectionFailure, ServerSelectionTimeoutError) as e:
         logger.error(f"Failed to connect to MongoDB: {e}")
@@ -226,7 +237,8 @@ def clear_cache():
 
 def get_client_id_from_request(request) -> str:
     """
-    Extract client_id from FastAPI request (query params or headers).
+    Extract client_id from request state (set by tenant context middleware).
+    Falls back to extracting from query params or headers if not in state.
     
     Args:
         request: FastAPI Request object
@@ -239,7 +251,11 @@ def get_client_id_from_request(request) -> str:
     """
     from fastapi import HTTPException
     
-    # Try to get client_id from query params or headers
+    # Try to get from request state (set by tenant context middleware)
+    if hasattr(request, 'state') and hasattr(request.state, 'client_id') and request.state.client_id:
+        return request.state.client_id
+    
+    # Fallback: Try to get client_id from query params or headers
     client_id = None
     if hasattr(request, 'query_params'):
         client_id = request.query_params.get("client_id")
@@ -265,4 +281,3 @@ def get_client_id_from_request(request) -> str:
         )
     
     return client_id
-
